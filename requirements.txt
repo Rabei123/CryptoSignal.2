@@ -1,0 +1,7 @@
+ccxt
+pandas
+ta
+gspread
+oauth2client
+python-telegram-bot
+mplfinance

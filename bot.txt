@@ -1,0 +1,171 @@
+import ccxt
+import pandas as pd
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from telegram import Bot
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import asyncio
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import io
+import logging
+import time
+from patterns import detect_bullish_patterns
+
+# === CONFIG ===
+volume_multiplier = 2
+timeframes = ['15m', '1h', '4h', '1d']
+take_profit_percentages = [0.05, 0.10, 0.20, 0.50]  # 5%, 10%, 20%, 50%
+stop_loss_percent = 0.01   # Stop loss at 1%
+
+# === TELEGRAM BOT CONFIG ===
+TELEGRAM_TOKEN = '8132154822:AAHJA0roirT1_IF3evlXvvM9JzROgk-vmAU'  # <-- Your bot token
+TELEGRAM_CHAT_ID = '6906353148'  # <-- Your chat ID
+
+# === GOOGLE SHEET CONFIG ===
+SHEET_NAME = 'CryptoSignals'
+CREDS_FILE = 'google-credentials.json'
+
+# === SETUP LOGGING ===
+logging.basicConfig(filename='crypto_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# === INIT ===
+bot = Bot(token=TELEGRAM_TOKEN)
+exchange = ccxt.binance()
+last_alerts = {}
+last_signal_time = {}
+
+def init_sheet():
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, scope)
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1
+
+sheet = init_sheet()
+
+def log_to_sheet(symbol, tf, price, rsi, macd, macd_signal, volume, is_volume_spike, timestamp, signal_type, take_profits, stop_loss):
+    try:
+        sheet.append_row(
+            [symbol, tf, round(price, 2), round(rsi, 2), round(macd, 4), round(macd_signal, 4), round(volume, 2), str(is_volume_spike), str(timestamp), signal_type] + take_profits + [stop_loss],
+            value_input_option='USER_ENTERED'
+        )
+    except Exception as e:
+        logging.error(f"Sheet log error: {e}")
+
+def fetch_data(symbol, timeframe):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        logging.error(f"Fetch error {symbol} {timeframe}: {e}")
+        return None
+
+def create_chart(df, symbol):
+    try:
+        df = df.set_index('timestamp')
+        last_candle_time = df.index[-1].strftime('%Y-%m-%d %H:%M')
+        fig_buf = io.BytesIO()
+        mpf.plot(df[-60:], type='candle', style='charles', volume=True, title=f'{symbol} | {last_candle_time}', savefig=dict(fname=fig_buf, dpi=150, bbox_inches='tight'))
+        fig_buf.seek(0)
+        return fig_buf
+    except Exception as e:
+        logging.error(f"Chart error: {e}")
+        return None
+
+async def send_telegram_message(msg, chart=None):
+    try:
+        if chart:
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=chart, caption=msg, parse_mode='Markdown')
+        else:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Telegram send error: {e}")
+
+async def analyze(df, symbol, timeframe):
+    df['avg_volume'] = df['volume'].rolling(20).mean()
+    df['volume_spike'] = df['volume'] > df['avg_volume'] * volume_multiplier
+    recent_high = df['high'].rolling(20).max()
+    df['breakout'] = df['close'] > recent_high.shift(1)
+
+    rsi = RSIIndicator(df['close'], window=14)
+    df['rsi'] = rsi.rsi()
+
+    macd = MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['macd_cross'] = df['macd'] > df['macd_signal']
+
+    latest = df.iloc[-1]
+    key = f"{symbol}_{timeframe}"
+    last_time = last_alerts.get(key)
+    current_time = time.time()
+
+    patterns_found = detect_bullish_patterns(df)
+    has_pattern = len(patterns_found) > 0
+
+    # Buy Signal: Bullish Pattern + Volume Spike + RSI < 70 + MACD Cross
+    if has_pattern and latest['volume_spike'] and latest['rsi'] < 70 and latest['macd_cross'] and latest['timestamp'] != last_time:
+        # Prevent repeat alerts
+        if current_time - last_signal_time.get(key, 0) < 7200:
+            return
+
+        take_profits = [round(latest['close'] * (1 + tp), 4) for tp in take_profit_percentages]
+        stop_loss = round(latest['close'] * (1 - stop_loss_percent), 4)
+
+        msg = (
+            "\U0001F4C8 *Bullish Signal Detected!*\n"
+            f"🔸 *Coin:* {symbol}\n"
+            f"⏱ *Timeframe:* {timeframe}\n"
+            f"💵 *Entry Price:* {latest['close']:.4f}\n"
+            f"🎯 *TP Levels:* {', '.join([str(tp) for tp in take_profits])}\n"
+            f"🛡 *Stop Loss:* {stop_loss}\n"
+            f"📊 RSI: {latest['rsi']:.2f} | MACD: {latest['macd']:.2f} / {latest['macd_signal']:.2f}\n"
+            f"🔎 *Pattern:* {', '.join(patterns_found)}\n"
+            f"🕒 *Time:* {latest['timestamp']}"
+        )
+
+        chart = create_chart(df.copy(), symbol)
+        if chart:
+            await send_telegram_message(msg, chart)
+        else:
+            await send_telegram_message(msg)
+
+        log_to_sheet(
+            symbol, timeframe, latest['close'], latest['rsi'],
+            latest['macd'], latest['macd_signal'],
+            latest['volume'], latest['volume_spike'],
+            latest['timestamp'], "BUY", take_profits, stop_loss
+        )
+
+        last_alerts[key] = latest['timestamp']
+        last_signal_time[key] = current_time
+        logging.info(f"Buy signal sent for {symbol} ({timeframe}) at {latest['timestamp']}")
+
+# Main loop that checks all symbols and timeframes
+async def auto_run():
+    while True:
+        await asyncio.to_thread(exchange.load_markets)
+        markets = exchange.load_markets()
+        all_symbols = [
+            symbol for symbol, data in markets.items()
+            if data.get('active') and symbol.endswith('/USDT') and ':' not in symbol
+        ]
+
+        for symbol in all_symbols:
+            for tf in timeframes:
+                logging.info(f"Checking {symbol} @ {tf}")
+                df = fetch_data(symbol, tf)
+                if df is not None:
+                    await analyze(df, symbol, tf)
+        logging.info("Cycle complete. Waiting 2 minutes...")
+        await asyncio.sleep(120)
+
+# Entry point
+if __name__ == "__main__":
+    asyncio.run(auto_run())
