@@ -3,5 +3,5 @@ pandas
 ta
 gspread
 oauth2client
-python-telegram-bot
+python-telegram-bot==20.3
 mplfinance
