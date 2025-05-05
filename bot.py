@@ -17,8 +17,14 @@ import os
 # === CREDENTIAL REBUILDING FROM ENV ===
 credentials_str = os.getenv("GOOGLE_CREDENTIALS_JSON")
 if credentials_str:
-    with open("google-credentials.json", "w") as f:
-        f.write(credentials_str.replace('\\n', '\n'))
+    try:
+        with open("google-credentials.json", "w") as f:
+            f.write(credentials_str.replace('\\n', '\n'))  # To handle newline characters correctly
+        logging.info("Google credentials file created successfully.")
+    except Exception as e:
+        logging.error(f"Failed to write credentials file: {e}")
+else:
+    logging.error("Google credentials not found in environment variable.")
 
 # === CONFIG ===
 volume_multiplier = 2
@@ -183,7 +189,6 @@ async def analyze(df, symbol, timeframe):
             f"📊 RSI: {latest['rsi']:.2f} | MACD: {latest['macd']:.2f}/{latest['macd_signal']:.2f} | Volume Spike: {latest['volume_spike']}\n"
             f"🔎 *Pattern:* {', '.join(patterns)}\n"
             f"🕒 *Time:* {latest['timestamp']}"
-
         )
         chart = create_chart(df.copy(), symbol)
         msg_id = await send_telegram_message(msg, chart)
@@ -218,80 +223,35 @@ async def check_tp_sl_trigger(symbol, current_price, timeframe):
         hit_tps = [tp for tp in tps if current_price >= tp]
         new_hits = [tp for tp in hit_tps if tp not in already_hit]
 
-        msg_update = ""
-
         if new_hits:
+            logging.info(f"Take Profit hit for {symbol} at {current_price}")
             for tp in new_hits:
-                profit_percentage = ((tp - entry_price) / entry_price) * 100
-                entry_time = pd.to_datetime(signal['timestamp'])
-                time_diff = pd.to_datetime('now') - entry_time
-                hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
-                minutes = remainder // 60
+                await send_telegram_message(f"🔴 Take Profit hit for {symbol} at {tp:.4f}")
+            signal['hit_tps'].extend(new_hits)
 
-                msg_update += f"\n\n🎯 *Take Profit Hit!*\n" \
-                              f"🔸 {symbol}\n" \
-                              f"📈 *TP Target*: {tps.index(tp) + 1} ✅\n" \
-                              f"Profit: {profit_percentage:.4f}% 📈\n" \
-                              f"Period: {hours}h {minutes}m ⏰\n" \
-                              f"📊 Current: {current_price:.4f}\n"
-
-            signal['hit_tps'] = already_hit + new_hits
-            if set(signal['hit_tps']) == set(tps):
-                del active_signals[symbol]
-            else:
-                active_signals[symbol] = signal
-            save_active_signals()
-
-        if not tp_hit and current_price <= sl:
-            msg_update += f"\n\n🛑 *Stop Loss Hit!*\n🔸 {symbol}\n📉 Entry: {entry_price} | SL: {sl}\n📊 Current: {current_price:.4f}"
+        if current_price <= sl:
+            logging.info(f"Stop Loss hit for {symbol} at {current_price}")
+            await send_telegram_message(f"🔴 Stop Loss hit for {symbol} at {sl}")
             del active_signals[symbol]
-            last_alerts[symbol] = time.time() - 7201
             save_active_signals()
-            save_last_alerts()
 
-            df_new = fetch_data(symbol, timeframe)
-            if df_new is not None and len(df_new) > 2:
-                patterns = detect_bullish_patterns(df_new)
-                latest = df_new.iloc[-1]
-                if patterns and df_new['macd_cross'].iloc[-1] and df_new['rsi'].iloc[-1] < 70 and df_new['volume_spike'].iloc[-1]:
-                    await analyze(df_new, symbol, timeframe)
-
-        if msg_update:
-            reply_id = signal.get('telegram_msg_id')
-            await send_telegram_message(msg_update, reply_to_message_id=reply_id)
-
-# === CLEANUP ===
-def cleanup_old_signals():
-    current_time = time.time()
-    global global_signal_timestamps
-    global_signal_timestamps = [ts for ts in global_signal_timestamps if current_time - ts <= 86400]
-
-# === MAIN LOOP ===
-async def auto_run():
-    while True:
-        await asyncio.to_thread(exchange.load_markets)
-        markets = exchange.load_markets()
-        excluded_fiats = {'USD', 'EUR', 'GBP', 'TRY', 'BRL', 'AUD', 'USDC', 'USDT', 'BUSD','XUSD'}
-        all_symbols = [
-            symbol for symbol, data in markets.items()
-            if data.get('active') and symbol.endswith('/USDT')
-            and not any(x in symbol for x in [':', 'UP', 'DOWN']) and symbol.split('/')[0] not in excluded_fiats
-        ]
-        for symbol in all_symbols:
-            for tf in timeframes:
-                try:
-                    df = fetch_data(symbol, tf)
-                    if df is not None and len(df) > 2:
-                        await analyze(df, symbol, tf)
-                        await check_tp_sl_trigger(symbol, df.iloc[-1]['close'], tf)
-                except Exception as e:
-                    logging.error(f"Error processing {symbol} @ {tf}: {e}")
-        logging.info("Cycle complete. Waiting 2 minutes...")
-        cleanup_old_signals()
-        await asyncio.sleep(120)
-
-# === ENTRY POINT ===
-if __name__ == "__main__":
+async def main():
     load_active_signals()
     load_last_alerts()
-    asyncio.run(auto_run())
+
+    while True:
+        for symbol in exchange.symbols:
+            if 'USDT' not in symbol:
+                continue
+
+            for timeframe in timeframes:
+                df = fetch_data(symbol, timeframe)
+                if df is not None:
+                    await analyze(df, symbol, timeframe)
+                    await check_tp_sl_trigger(symbol, df['close'].iloc[-1], timeframe)
+        await asyncio.sleep(60)
+
+# === RUN ===
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
